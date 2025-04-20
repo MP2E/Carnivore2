@@ -5,7 +5,7 @@
 library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.std_logic_unsigned.all;
-
+use IEEE.numeric_std.all;
 
 entity mcscc is
   port(
@@ -120,21 +120,35 @@ architecture RTL of mcscc is
     );
   end component;
   
-  component opll
+  component IKAOPLL
+    generic(
+      FULLY_SYNCHRONOUS : integer := 1;
+      FAST_RESET : integer := 1;
+      ALTPATCH_CONFIG_MODE : integer := 0;
+      USE_PIPELINED_MULTIPLIER : integer := 1
+    );
     port(
-      xin  	: in std_logic;
-      xout  : out std_logic;
-      xena  : in std_logic;
-      d 	: in std_logic_vector(7 downto 0);      
-      a     : in std_logic;
-      cs_n    : in std_logic;
-      we_n    : in std_logic;
-      ic_n    : in std_logic;
---      mo     : out std_logic_vector(9 downto 0);
---      ro     : out std_logic_vector(9 downto 0);
-      BCMO		: out std_logic_vector(15 downto 0);
-	  BCRO 		: out std_logic_vector(15 downto 0);
-      SDO	 : out std_logic
+      i_XIN_EMUCLK : in std_logic;
+      o_XOUT : out std_logic;
+      i_phiM_PCEN_n : in std_logic;
+      i_IC_n : in std_logic;
+      i_ALTPATCH_EN : in std_logic;
+      i_CS_n : in std_logic;
+      i_WR_n : in std_logic;
+      i_A0 : in std_logic;
+      i_D : in std_logic_vector(7 downto 0);
+      o_D : out std_logic_vector(1 downto 0);
+      o_D_OE : out std_logic;
+      o_DAC_EN_MO : out std_logic;
+      o_DAC_EN_RO : out std_logic;
+      o_IMP_NOFLUC_SIGN : out std_logic;
+      o_IMP_NOFLUC_MAG : out std_logic_vector(7 downto 0);
+      o_IMP_FLUC_SIGNED_MO : out signed(9 downto 0);
+      o_IMP_FLUC_SIGNED_RO : out signed(9 downto 0);
+      i_ACC_SIGNED_MOVOL : in signed(4 downto 0);
+      i_ACC_SIGNED_ROVOL : in signed(4 downto 0);
+      o_ACC_SIGNED_STRB : out std_logic;
+      o_ACC_SIGNED : out signed(15 downto 0)
       );
   end component;
   
@@ -342,7 +356,6 @@ architecture RTL of mcscc is
 
 -- FM Pack
   signal clk21m  : std_logic;
-  signal xena    : std_logic;
   signal pYM2413_Cs_n     : std_logic;
   signal pYM2413_We_n     : std_logic;
   signal pYM2413_A		: std_logic;
@@ -356,7 +369,6 @@ architecture RTL of mcscc is
   signal R7FF7	:std_logic_vector(1 downto 0);
   signal R5FFE	:std_logic_vector(7 downto 0);
   signal R5FFF	:std_logic_vector(7 downto 0);  
-  
   
 --  PLL
   signal areset		: STD_LOGIC;
@@ -378,10 +390,10 @@ architecture RTL of mcscc is
   signal DCR		: std_logic_vector(11 downto 0);
   signal ACMO		: std_logic_vector(15 downto 0);
   signal ACRO 		: std_logic_vector(15 downto 0);
-  signal BCMO		: std_logic_vector(15 downto 0);
-  signal BCRO 		: std_logic_vector(15 downto 0);
-  signal SDO		:std_logic; 
-  signal SDOp		:std_logic; 
+  signal BCO		: signed(15 downto 0);
+  signal BCO_OUT	: signed(15 downto 0);
+  signal ACC_SIGNED_STRB : std_logic;
+  signal SDOp		: std_logic;
   signal SDOc  		:std_logic_vector(15 downto 0);    
   signal FDIV	:std_logic_vector(7 downto 0);
   signal SDAC		:std_logic;
@@ -1801,11 +1813,31 @@ begin
 -- FM Pack Register
 ----------------------------------------------------------------
 
-  U1 : opll port map (pSltClk_n, open, xena, pSltDat, pYM2413_A, pYM2413_Cs_n, pYM2413_We_n, 
-                      pSltRst_n, BCMO, BCRO, SDO);
+  U1 : IKAOPLL
+  generic map 
+    (
+    FULLY_SYNCHRONOUS => 1,
+    FAST_RESET => 1,
+    ALTPATCH_CONFIG_MODE => 0,
+    USE_PIPELINED_MULTIPLIER => 1
+    )
+  port map
+    (
+    i_XIN_EMUCLK => pSltClk_n,
+    i_phiM_PCEN_n => '0',
+    i_IC_n => pSltRst_n,
+    i_ALTPATCH_EN => '0',
+    i_CS_n => pYM2413_Cs_n,
+    i_WR_n => pYM2413_We_n,
+    i_A0 => pYM2413_A,
+    i_D => pSltDat,
+    i_ACC_SIGNED_MOVOL => to_signed(9, 5),
+    i_ACC_SIGNED_ROVOL => to_signed(15, 5),
+    o_ACC_SIGNED_STRB => ACC_SIGNED_STRB,
+    o_ACC_SIGNED => BCO
+    );
 --  clk21m <= pSltClk;
   pYM2413_A <= pSltAdr(0);
-  xena <=  '1';
 --pYM2413_We_n <= not WRh1;-- pSltWr_n;
   pYM2413_We_n <= Wr_n;-- pSltWr_n;
   pYM2413_Cs_n <= '0' when pSltAdr(7 downto 1) = "0111110" and pSltIorq_n = '0' 
@@ -1818,7 +1850,13 @@ begin
 --       mix := ('0'&MO) + ('0'&RO) - "010 0000 0000";
 --		mix <= ('0'&MO) + ('0'&RO) - "01000000000"; --(10)
 --        wav <= mix(wav'range);-- 10 downto 0
-        
+
+  process (pSltClk_n, ACC_SIGNED_STRB)
+  begin
+    if (ACC_SIGNED_STRB'event and ACC_SIGNED_STRB = '1') then
+      BCO_OUT <= BCO;
+    end if;
+  end process;
         
 ----------------------------------------------------------------
 -- Audio Mixer RO,MO(9 downto 0),SCC, Filter
@@ -1900,8 +1938,8 @@ begin
 ----------------------------------------------------------------
 -- Volume regulator
 ----------------------------------------------------------------
-  VMFL : mv16 port map (BCMO, MFL, LVF);
-  VMFR : mv16 port map (BCRO, MFR, LVF);
+  VMFL : mv16 port map (std_logic_vector(BCO_OUT), MFL, LVF);
+  VMFR : mv16 port map (std_logic_vector(BCO_OUT), MFR, LVF);
   VMSL : mv16 port map (MACL, MSL, LVS);
   VMGL : mv16 port map (MACP, MPL, LVP);
   VMBL : mv16 port map (MACB, MBL, LVB);
