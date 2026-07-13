@@ -99,24 +99,28 @@ end mcscc;
 architecture RTL of mcscc is
 
 
-    component scc_wave
-    port(
-      pSltClk_n : IN std_logic;
-      pSltRst_n : IN std_logic;
-      pSltAdr   : IN std_logic_vector(7 downto 0);
-      pSltDat   : INOUT std_logic_vector(7 downto 0);
-      SccAmp    : OUT std_logic_vector(10 downto 0);
-
-      SccRegWe  : IN std_logic;
-      SccModWe  : IN std_logic;
-      SccWavCe  : IN std_logic;
-      SccWavOe  : IN std_logic;
-      SccWavWe  : IN std_logic;
-      SccWavWx  : IN std_logic;
-      SccWavAdr : IN std_logic_vector(4 downto 0);
-      SccWavDat : IN std_logic_vector(7 downto 0);
-      DOutEn_n		: IN std_logic;
-      DOut		: INOUT std_logic_vector(7 downto 0)
+    component IKASCC_player_s
+    generic (
+      RAM_TYPE      : integer := 1;
+      FAST_CLOCK    : integer := 0;
+      RAMCTRL_ASYNC : integer := 0
+    );
+    port (
+      i_EMUCLK      : in  std_logic;
+      i_MCLK_PCEN_n : in  std_logic;
+      i_RST_n       : in  std_logic;
+      i_SCCREG_EN   : in  std_logic;
+      i_SCC_PLUS_MODE : in std_logic;
+      i_CS_n        : in  std_logic;
+      i_RD_n        : in  std_logic;
+      i_WR_n        : in  std_logic;
+      i_RDRQ        : in  std_logic;
+      i_WRRQ        : in  std_logic;
+      i_ABLO        : in  std_logic_vector(7 downto 0);
+      i_DB          : in  std_logic_vector(7 downto 0);
+      o_DB          : out std_logic_vector(7 downto 0);
+      o_TEST        : out std_logic;
+      o_SOUND       : out signed(10 downto 0)
     );
   end component;
   
@@ -203,16 +207,31 @@ architecture RTL of mcscc is
   signal SccModeA    : std_logic_vector(7 downto 0);
   signal SccModeB    : std_logic_vector(7 downto 0);
 
-  signal SccRegWe    : std_logic;
-  signal SccModWe    : std_logic;
-  signal SccWavCe    : std_logic;
-  signal SccWavOe    : std_logic;
-  signal SccWavWe    : std_logic;
-  signal SccWavWx    : std_logic;
-  signal SccWavAdr   : std_logic_vector(4 downto 0);
-  signal SccWavDat   : std_logic_vector(7 downto 0);
-
-  signal SccAmp      : std_logic_vector(10 downto 0);
+  signal SccRegEn    : std_logic;
+  signal SccBusCs_n  : std_logic;
+  signal SccReadRq   : std_logic;
+  signal SccWriteRq  : std_logic;
+  signal SccDbOut    : std_logic_vector(7 downto 0);
+  signal SccDbIn     : std_logic_vector(7 downto 0);
+  signal SccDbOe     : std_logic;
+  signal SccAbLo     : std_logic_vector(7 downto 0);
+  signal SccSound    : signed(10 downto 0);
+  signal SccRdSync   : std_logic_vector(1 downto 0);
+  signal SccWrSync   : std_logic_vector(1 downto 0);
+  -- CPU-visible SCC wave RAM read-back shadow. IKASCC handles sound, but its
+  -- registered block-RAM read reaches the pin via a long async/mux path that is
+  -- marginal on this near-full device (KMG's precise write/read-back probe fails
+  -- while streaming audio tolerates it). This shadow replicates the proven
+  -- scc_wave CPU read/write behaviour across all channels (offsets 00-9F) with a
+  -- short, stable register->pin path.
+  type   SccWaveShadow_t is array (0 to 255) of std_logic_vector(7 downto 0);
+  signal SccWaveShadow : SccWaveShadow_t;
+  -- Force M4K block RAM (must NOT infer 2048 registers on this near-full device).
+  attribute ramstyle : string;
+  attribute ramstyle of SccWaveShadow : signal is "M4K";
+  signal SccShadowQ    : std_logic_vector(7 downto 0);
+  signal SccWaveOe     : std_logic;
+  signal SccWaveWe     : std_logic;
 
 -- Multimode card register
 
@@ -381,9 +400,8 @@ architecture RTL of mcscc is
   signal L_AOUT		: std_logic_vector(15 downto 0);
   signal R_AOUT		: std_logic_vector(15 downto 0);
   signal T1			: std_logic;
-  signal LRCKe		: std_logic;
-  signal ACL		: std_logic_vector(19 downto 0);
-  signal ACR		: std_logic_vector(19 downto 0);
+  signal ACS		: signed(19 downto 0);
+  signal resS		: std_logic;
   signal SCL		: std_logic_vector(11 downto 0);
   signal SCR		: std_logic_vector(11 downto 0);
   signal DCL		: std_logic_vector(11 downto 0);
@@ -410,10 +428,8 @@ architecture RTL of mcscc is
   signal LVS		:std_logic_vector(2 downto 0);
   signal LVL	    :std_logic_vector(7 downto 0) := "00011011" ;
   signal LVL1	    :std_logic_vector(7 downto 0) := "00011011" ;  
-  signal rsta0    	:std_logic;
-  signal rsta1    	:std_logic;
-  signal LVP		:std_logic_vector(2 downto 0);
-  signal LVB		:std_logic_vector(2 downto 0);
+  signal LVP		: std_logic_vector(2 downto 0);
+  signal LVB		: std_logic_vector(2 downto 0);
   signal SCP		:std_logic_vector(9 downto 0); 
   signal SCB		:std_logic_vector(9 downto 0);  
   signal ACP		:std_logic_vector(18 downto 0); 
@@ -835,7 +851,7 @@ begin
          AddrM0	<= "00000000";
          AddrM1 <= "00000000";
          AddrM2 <= "0000000";
-         AddrFR    <= "0000000";  -- shift  addr Flash Rom x 64êá
+         AddrFR    <= "0000000";  -- shift  addr Flash Rom x 64ï¿½ï¿½
          aAddrFR    <= "0000000";
          R1Mult    <= "10000101"; -- 7b - enable page register bank 1
                                -- 6b - 
@@ -1312,10 +1328,6 @@ begin
       SccModeA   <= (others => '0');
       SccModeB   <= (others => '0');
 
-      SccWavWx   <= '0';
-      SccWavAdr  <= (others => '0');
-      SccWavDat  <= (others => '0');
-
     elsif (pSltClk_n'event and pSltClk_n = '1') then
 
           -- Mapped I/O port access on 5000-57FFh ... Bank resister write
@@ -1351,57 +1363,106 @@ begin
         SccModeB <= pSltDat;
       end if;
 
-      -- Mapped I/O port access on 9860-987Fh ... Wave memory copy
-      if (SccEna = '1' and pSltWr_n = '0' and pSltAdr(7 downto 5) = "011" and
-          DevHit = '1' and SccModeB(4) = '0' and DecSccA = '1') then
-        SccWavAdr <= pSltAdr(4 downto 0);
-        SccWavDat <= pSltDat;
-        SccWavWx  <= '1';
-      else
-        SccWavWx  <= '0';
-      end if;
-
     end if;
 
   end process;
 
-  -- Mapped I/O port access on 9800-987Fh / B800-B89Fh ... Wave memory
-  SccWavCe <= '1' when SccEna = '1' and DevHit = '1' and SccModeB(4) = '0' and
-                       (DecSccA = '1' or DecSccB = '1')
+  -- IKASCC register window: classic 9800 (DecSccA) and SCC+ mirror B800 (DecSccB).
+  -- Carnivore2 mapper/mode logic stays here; IKASCC_player_s handles sound only.
+  -- SCCREG_EN must stay active for the whole bus cycle; IKASCC WRRQ/RDRQ are
+  -- edge-detected one cycle after DevHit, so do not gate on DevHit here.
+  -- Exclude the SCC+ mode register (BFFE/BFFF) from the IKASCC register window:
+  -- it sits inside the DecSccB (B800-BFFF) range, and IKASCC only sees the low
+  -- address byte, so it would mis-decode a BFFF write as a deformation/test
+  -- write (i_ABLO[7:5]="111") and corrupt its test register. The mapper handles
+  -- SccModeB separately; the real deformation reg (B8E0-B8FF, Dec1FFE='0') is
+  -- unaffected.
+  SccRegEn <= '1' when SccEna = '1' and SccModeB(4) = '0' and
+                       (DecSccA = '1' or (DecSccB = '1' and Dec1FFE = '0'))
                   else '0';
 
-  -- Mapped I/O port access on 9800-987Fh / B800-B89Fh ... Wave memory
-  SccWavOe <= '1' when SccEna = '1' and pSltRd_n = '0' and SccModeB(4) = '0' and
-                       ((DecSccA = '1' and pSltAdr(7) = '0') or
-                        (DecSccB = '1' and (pSltAdr(7) = '0' or pSltAdr(6 downto 5) = "00")))
-                  else '0';
+  -- Per-transaction chip select (IKASCC async bus), not slot select.
+  SccBusCs_n <= '1' when Sltsl_C_n = '1' or (pSltRd_n = '1' and pSltWr_n = '1') else '0';
 
-  -- Mapped I/O port access on 9800-987Fh / B800-B89Fh ... Wave memory
-  SccWavWe <= '1' when SccEna = '1' and pSltWr_n = '0' and DevHit = '1' and SccModeB(4) = '0' and
-                       ((DecSccA = '1' and pSltAdr(7) = '0') or DecSccB = '1')
-                  else '0';
+  SccDbIn <= pSltDat;
 
-  -- Mapped I/O port access on 9880-988Fh / B8A0-B8AF ... Resister write
-  SccRegWe <= '1' when SccEna = '1' and pSltWr_n = '0' and
-                       ((DecSccA = '1' and pSltAdr(7 downto 5) = "100") or
-                        (DecSccB = '1' and pSltAdr(7 downto 5) = "101")) and
-                       DevHit = '1' and SccModeB(4) = '0'
-                  else '0';
+  process(pSltClk_n)
+  begin
+    if (pSltClk_n'event and pSltClk_n = '1') then
+      SccRdSync(0) <= SccBusCs_n;
+      SccWrSync(0) <= SccBusCs_n or Wr_n;
+      SccRdSync(1) <= SccRdSync(0);
+      SccWrSync(1) <= SccWrSync(0);
+    end if;
+  end process;
 
-  -- Mapped I/O port access on 98C0-98FFh / B8C0-B8DFh ... Resister write
-  SccModWe <= '1' when SccEna = '1' and pSltWr_n = '0' and pSltAdr(7 downto 6) = "11" and
-                       (DecSccA = '1' or (pSltAdr(5) = '0' and DecSccB = '1')) and
-                       DevHit = '1' and SccModeB(4) = '0'
+  SccReadRq  <= '1' when SccRdSync = "10" or SccRdSync = "00" else '0';
+  SccWriteRq <= '1' when SccWrSync = "10" else '0';
+
+  -- SCC register/file address: pass CPU low byte through unchanged.
+  -- B880-B89F (ch5 wave) must not be remapped; DecSccB is SCC+ only.
+  SccAbLo <= pSltAdr(7 downto 0);
+
+  SccDbOe <= '1' when SccRegEn = '1' and pSltRd_n = '0' and
+                       (pSltAdr(7) = '0' or
+                        (DecSccB = '1' and pSltAdr(7 downto 5) /= "111") or
+                        (DecSccA = '1' and pSltAdr(7 downto 5) = "101"))
                   else '0';
 
   ----------------------------------------------------------------
-  -- Connect components
+  -- CPU-visible wave RAM read-back shadow (all channels)
+  -- Mirrors the original scc_wave SccWavWe / SccWavOe decode so the CPU
+  -- always reads back exactly what it wrote to the wave window, including
+  -- KMG's disable/re-enable anti-phantom probe (writes while the window is
+  -- disabled are gated off by DecSccA/DecSccB, so the test byte survives).
   ----------------------------------------------------------------
+  SccWaveWe <= '1' when SccEna = '1' and pSltWr_n = '0' and DevHit = '1' and SccModeB(4) = '0' and
+                        ((DecSccA = '1' and pSltAdr(7) = '0') or DecSccB = '1')
+                   else '0';
 
-  SccCh  : scc_wave
-    port map(
-      pSltClk_n, pSltRst_n, pSltAdr(7 downto 0), pSltDat, SccAmp,
-      SccRegWe, SccModWe, SccWavCe, SccWavOe, SccWavWe, SccWavWx, SccWavAdr, SccWavDat, DOutEn_n, DOut(7 downto 0) 
+  SccWaveOe <= '1' when SccEna = '1' and pSltRd_n = '0' and SccModeB(4) = '0' and
+                        ((DecSccA = '1' and pSltAdr(7) = '0') or
+                         (DecSccB = '1' and (pSltAdr(7) = '0' or pSltAdr(6 downto 5) = "00")))
+                   else '0';
+
+  process(pSltClk_n)
+  begin
+    if (pSltClk_n'event and pSltClk_n = '1') then
+      if (SccWaveWe = '1') then
+        SccWaveShadow(to_integer(unsigned(pSltAdr(7 downto 0)))) <= pSltDat;
+      end if;
+      SccShadowQ <= SccWaveShadow(to_integer(unsigned(pSltAdr(7 downto 0))));
+    end if;
+  end process;
+
+  pSltDat <= SccShadowQ when SccWaveOe = '1' else
+             SccDbOut   when SccDbOe   = '1' else
+             DOut       when DOutEn_n  = '0' else (others => 'Z');
+
+  -- IKASCC audio couples via signed ACS->MACL (see Audio Mixer), not the old SCL path.
+
+  SccCh : IKASCC_player_s
+    generic map (
+      RAM_TYPE      => 1,
+      FAST_CLOCK    => 0,
+      RAMCTRL_ASYNC => 1
+    )
+    port map (
+      i_EMUCLK      => pSltClk_n,
+      i_MCLK_PCEN_n => '0',
+      i_RST_n       => pSltRst_n,
+      i_SCCREG_EN   => SccRegEn,
+      i_SCC_PLUS_MODE => SccModeB(5),
+      i_CS_n        => SccBusCs_n,
+      i_RD_n        => pSltRd_n,
+      i_WR_n        => pSltWr_n,
+      i_RDRQ        => SccReadRq,
+      i_WRRQ        => SccWriteRq,
+      i_ABLO        => SccAbLo,
+      i_DB          => SccDbIn,
+      o_DB          => SccDbOut,
+      o_TEST        => open,
+      o_SOUND       => SccSound
     );
 
   ----------------------------------------------------------------
@@ -1862,10 +1923,9 @@ begin
 -- Audio Mixer RO,MO(9 downto 0),SCC, Filter
 ----------------------------------------------------------------
 
---  SCL <= ("0"&MO&"0")+('0'&(SccAmp+"100 0000 0000")) ;
---  SCR <= ("0"&RO&"0")+('0'&(SccAmp+"10000000000")) ;
-  SCL <= "100000000000" + SccAmp ;--+ PsgAmp + KC ;
-  SCR <= "100000000000" + SccAmp;-- + PsgAmp + KC ;
+-- Legacy SCL offset-binary coupler parked silent; IKASCC uses ACS->MACL below.
+  SCL <= x"800";
+  SCR <= x"800";
   process (pSltClk_n)
   begin
     if pSltRst_n = '0' then FDIV <= "00000000";
@@ -1874,41 +1934,32 @@ begin
     end if;
   end process;
 
-
--- filter SCC
-
-  process (pSltClk_n,LRCKe,pSltClk2)
+-- filter SCC: PSG-style signed boxcar into MACL (same SDAC window as PSG/OPLL mixer).
+-- Must NOT gate on SccEna (that follows Sltsl_C_n); clearing ACS when the CPU
+-- leaves the slot wiped the integrator every few clocks and killed the audio.
+  process (pSltClk_n, resS, pSltRst_n)
   begin
-    if LRCKe = '0' then rsta1 <= '0';
-    elsif pSltClk2'event and pSltClk2 ='1' then
-      if LRCKe = '1' and pSltClk_n ='0' and rsta1 = '0' then
-         rsta1 <= '1'; rsta0 <='1';
-      else 
-         rsta0 <= '0';
+    if pSltRst_n = '0' or resS = '1' then
+      ACS <= (others => '0');
+    elsif pSltClk_n'event and pSltClk_n = '0' then
+      if CardMDR(4) = '1' then
+        ACS <= ACS + resize(SccSound, 20);
       end if;
-     end if;
-  end process;
-  process (pSltClk_n,LRCKe)
-  begin
-    if  LRCKe = '1' then ACL <= "00000000000000000000"; ACR <= "00000000000000000000"; --(0)
-    elsif pSltClk_n'event and pSltClk_n ='0' then
-      ACL <= ACL + (not SCL(11) & not SCL(11) & not SCL(11) & not SCL(11) & 
-                    not SCL(11) & not SCL(11) & not SCL(11) & not SCL(11) & 
-                    not SCR(11) & SCL(10 downto 0) ) ;   -- (19-0)       
     end if;
   end process;
- -- process (FDIV(5),FDIV(0))
-  process (SDAC,pSltClk_n)
+
+  process (SDAC, pSltClk_n)
   begin
-    if pSltClk_n ='0' then LRCKe <= '0';
---    elsif FDIV(5)'event and FDIV(5) = '0' then
+    if pSltClk_n = '0' then
+      resS <= '0';
     elsif SDAC'event and SDAC = '0' then
-      MACL <=  ACL(17 downto 2);
-      MACR <=  ACL(17 downto 2);
---    MACR <=  ACR(18 downto 3);-- (not ACR(19)) & ACR(18 downto 4);
-      LRCKe <= '1';
+      -- ACS(18 downto 3): same slice width as PSG ACP(18 downto 3); tune if level off
+      MACL <= std_logic_vector(ACS(18 downto 3));
+      MACR <= std_logic_vector(ACS(18 downto 3));
+      resS <= '1';
     end if;
   end process;
+
   process (pSltClk_n)
   begin
     if pSltClk_n'event and pSltClk_n = '1' then

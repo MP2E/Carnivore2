@@ -243,10 +243,10 @@ set_global_assignment -name VERILOG_FILE IKAOPLL/src/IKAOPLL_modules/IKAOPLL_pri
 set_global_assignment -name VERILOG_FILE IKAOPLL/src/IKAOPLL_modules/IKAOPLL_reg.v
 set_global_assignment -name VERILOG_FILE IKAOPLL/src/IKAOPLL_modules/IKAOPLL_timinggen.v
 set_global_assignment -name VERILOG_FILE IKAOPLL/src/IKAOPLL.v
+set_global_assignment -name VERILOG_FILE IKASCC/src/IKASCC_modules/IKASCC_primitives.v
+set_global_assignment -name VERILOG_FILE IKASCC/src/IKASCC_modules/IKASCC_player_s.v
 set_global_assignment -name VHDL_FILE MPLL2.vhd
 set_global_assignment -name VHDL_FILE mcscc.vhd
-set_global_assignment -name VHDL_FILE lpm_ram.vhd
-set_global_assignment -name VHDL_FILE scc_wave.vhd
 set_global_assignment -name CDF_FILE scc.cdf
 set_global_assignment -name QIP_FILE MPLL1.qip
 set_global_assignment -name QIP_FILE MPLL2.qip
